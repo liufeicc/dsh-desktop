@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# 启动 DSH 桌面版（Electron 壳）。
+#
+# 两个必须在这里做、不能只写在 main.js 里的事：
+#   1. 补 PATH：从 .desktop 启动时 PATH 里没有 ~/.npm-global/bin，dsh 命令会找不到；
+#   2. 传 --no-sandbox：Linux 上 Electron 的 chrome-sandbox 需要 root:root + 4755 权限，
+#      普通用户装的 node_modules 不满足，必须在进程启动时就带上这个开关。
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ELECTRON_BIN="${APP_DIR}/node_modules/electron/dist/electron"
+
+if [[ ! -x "${ELECTRON_BIN}" ]]; then
+  echo "找不到 Electron 可执行文件：${ELECTRON_BIN}" >&2
+  echo "请先在 ${APP_DIR} 下执行 npm install" >&2
+  exit 1
+fi
+
+export PATH="${HOME}/.npm-global/bin:${HOME}/.local/bin:${PATH}"
+exec "${ELECTRON_BIN}" --no-sandbox "${APP_DIR}" "$@"

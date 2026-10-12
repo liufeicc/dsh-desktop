@@ -1,0 +1,16 @@
+{
+  "name": "dsh-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把 DSH 的 Web UI 包装成 Linux 桌面程序（Electron 壳），关窗口即退出并回收后台服务",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron --no-sandbox .",
+    "icons": "python3 tools/make-icons.py",
+    "install-launcher": "bash tools/install-launcher.sh",
+    "e2e-close": "bash tools/e2e-close-test.sh"
+  },
+  "devDependencies": {
+    "electron": "30.5.1"
+  }
+}
