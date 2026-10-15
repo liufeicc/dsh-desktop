@@ -6,13 +6,18 @@
 #   那个用假 dsh，跑得快，验证壳的复用逻辑；
 #   这个用真 dsh，慢（要装配整个 profile），验证「第二个窗口加载真页面会不会失败」。
 #
+# 第四版起，本脚本还负责验证「先关主壳」这条真实路径（假 dsh 版本见 e2e-owner-first-test.sh）：
+#   主壳退出后真实 dsh 服务必须活着、公告地址必须还能换 cookie、副本与后来新开的窗口都能继续用；
+#   直到最后一个窗口退出，真实服务才被回收。用真 dsh 验证这一点，才能确认「服务进程自己
+#   收到 SIGTERM 时会不会连累其它窗口」这类只在真实实现上才有的行为。
+#
 # 隔离方式：
 #   DSH_DESKTOP_APP_DIR  指向 /tmp 下的独立数据目录
 #   DSH_HOME             指向独立 harness home，避免和用户正在用的会话/配置互相干扰
 #   --user-data-dir      一份独立的 Chromium 用户数据（两个壳共用，复现真实情形）
 #
 # 注意：DSH_HOME 是空的，所以这次启动的 profile 是最原始的（没有用户插件）。
-# 我们要验证的是「传输层能不能两个窗口同时看一个地址」，与装了哪些插件无关。
+# 我们要验证的是「传输层能不能多个窗口同时看一个地址」，与装了哪些插件无关。
 
 set -uo pipefail
 
@@ -142,10 +147,10 @@ if [[ -n "${REAL_URL:-}" ]]; then
   fi
 fi
 
-log "收尾：关掉两个壳"
-kill -TERM "$PID2" 2>/dev/null
-sleep 3
-if alive "$PID1"; then ok "关掉副壳后主壳仍在"; else bad "主壳被带走了"; fi
+# ── 第四版的核心场景：先关「主的」窗口，副本必须继续可用 ──────────────
+log "关键场景（真实 dsh）：先关主壳，后台服务必须活着、副本必须还能用"
+REAL_SERVER_PID="$(grep -o '"serverPid": *[0-9]*' "$ROOT/app/endpoint.json" | grep -o '[0-9]*' | head -1)"
+info "被公告的真实服务器 pid=$REAL_SERVER_PID"
 
 kill -TERM "$PID1" 2>/dev/null
 if wait_until 25 "! kill -0 $PID1 2>/dev/null"; then
@@ -153,12 +158,84 @@ if wait_until 25 "! kill -0 $PID1 2>/dev/null"; then
 else
   bad "主壳未退出"
 fi
+sleep 3
+
+if [[ -n "$REAL_SERVER_PID" ]] && kill -0 "$REAL_SERVER_PID" 2>/dev/null; then
+  ok "★ 主壳退出后，真实 dsh 服务（pid=$REAL_SERVER_PID）仍然在跑"
+else
+  bad "★ 主壳退出把真实 dsh 服务带走了 —— 副本会立刻失去后端"
+fi
+if alive "$PID2"; then ok "副本壳仍然存活"; else bad "副本壳意外退出"; fi
+if [[ -s "$ROOT/app/endpoint.json" ]]; then
+  ok "地址公告仍然保留"
+else
+  bad "地址公告被撤掉了（后来者会以为没有可用服务）"
+fi
+# 真实服务是否还能服务页面：拿公告里的地址换一次 cookie
+if [[ -n "${REAL_URL:-}" ]]; then
+  PORT="$(echo "$REAL_URL" | sed -E 's#.*:([0-9]+)/.*#\1#')"
+  TOKEN="$(echo "$REAL_URL" | sed 's/.*token=//')"
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/?token=${TOKEN}")"
+  if [[ "$CODE" == "303" ]]; then
+    ok "★ 主壳退出后公告地址依然可用（303），副本的后端没断"
+  else
+    bad "★ 主壳退出后公告地址失效（HTTP $CODE）"
+  fi
+fi
+
+log "再开第三个壳：应复用同一台真实服务（不许另起）"
+PID3="$(run_shell "$ROOT/ud1")"
+PIDS+=("$PID3")
+info "壳3 pid=$PID3"
+if wait_until 60 "grep -q '本窗口不再启动服务器' '$ROOT/app/app.log'"; then
+  ok "壳3 复用了现成的服务"
+else
+  bad "壳3 没有复用，可能自己起了一台新服务"
+fi
+sleep 3
+if [[ -n "$REAL_SERVER_PID" ]] && kill -0 "$REAL_SERVER_PID" 2>/dev/null; then
+  ok "复用的仍是原来那台服务（pid=$REAL_SERVER_PID）"
+else
+  bad "原来的服务没了"
+fi
+kill -TERM "$PID3" 2>/dev/null
+wait_until 20 "! kill -0 $PID3 2>/dev/null" && ok "壳3 已退出（还有副本在用，服务不受影响）" || bad "壳3 未退出"
 sleep 2
+if [[ -n "$REAL_SERVER_PID" ]] && kill -0 "$REAL_SERVER_PID" 2>/dev/null; then
+  ok "壳3 退出后服务仍在（副本还在用）"
+else
+  bad "壳3 退出把服务带走了"
+fi
+
+log "收尾：关掉最后一个窗口（副本）——此时才允许回收真实服务"
+kill -TERM "$PID2" 2>/dev/null
+if wait_until 25 "! kill -0 $PID2 2>/dev/null"; then
+  ok "副本壳已退出"
+else
+  bad "副本壳未退出"
+fi
+sleep 3
 if pgrep -f "$ROOT/home" >/dev/null 2>&1; then
   bad "仍有属于本次测试的 dsh 进程残留"
   pgrep -af "$ROOT/home" | sed 's/^/      /'
 else
-  ok "测试用的 dsh 服务已回收"
+  ok "★ 所有窗口关闭后，真实 dsh 服务已回收，无残留"
+fi
+if [[ -f "$ROOT/app/endpoint.json" ]]; then
+  bad "所有窗口关闭后公告仍然存在"
+else
+  ok "地址公告已撤下"
+fi
+if grep -q '退出判定：本窗口是最后一个使用者，回收后台服务' "$ROOT/app/app.log"; then
+  ok "最后一个窗口的退出判定是「回收后台服务」"
+else
+  bad "最后一个窗口的退出判定不对"
+fi
+LEFT_CLIENTS="$(ls "$ROOT/app/clients" 2>/dev/null | grep -c '\.json$' || true)"
+if [[ "$LEFT_CLIENTS" -eq 0 ]]; then
+  ok "客户端登记表已清空"
+else
+  bad "客户端登记表里还剩 $LEFT_CLIENTS 个文件"
 fi
 
 printf '\n\033[1m结果：%d 通过，%d 失败\033[0m\n' "$PASS" "$FAIL"

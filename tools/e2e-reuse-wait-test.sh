@@ -209,7 +209,7 @@ kill -TERM "$PID_B" 2>/dev/null
 sleep 3
 if alive "$PID_A"; then ok "关掉壳B 后壳A 仍在运行"; else bad "壳A 被壳B 的退出带走了"; fi
 if [[ -s "$ROOT/app/endpoint.json" ]]; then
-  ok "公告仍在（壳B 没有误删主实例的公告）"
+  ok "公告仍在（壳B 不是最后一个使用者，没去动公告与服务器）"
 else
   bad "公告被壳B 误删了"
 fi

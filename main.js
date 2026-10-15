@@ -21,28 +21,59 @@
  *
  * 万一连 exit 都没跑到（kill -9、崩溃），还有最后一层：lib/server.js 会把托管的
  * 服务器 pid 记在 ~/.dsh-desktop/server.pid，下次启动壳时先把这类残留收干净。
- * 这样「壳没了、后台服务还在跑」这件事在四条路径之外也不会发生。
  *
  * ── 多窗口（2026-10-14 第三版，按用户明确要求改）─────────────────────────
  * 用户有两块屏，需要在两个屏幕上都操作 DSH，原来的行为是「第二次点图标只把已有窗口
  * 叫到前台」——因为 requestSingleInstanceLock() 拿不到锁就退出。现在改成「复用优先」：
  *
  *   第一个壳：照旧拉起自己的 dsh web，并把访问地址公告到 ~/.dsh-desktop/endpoint.json；
- *   后续的壳：读到公告且写公告的壳还活着 → 直接加载同一个地址，自己不起服务器。
+ *   后续的壳：读到公告且那台服务器确实还活着 → 直接加载同一个地址，自己不起服务器。
  *
  * 于是第二个窗口和第一个窗口是同一个后端（正如「两个浏览器窗口看同一个页面」），
  * 不额外占用一个 node 服务进程。对应的差异必须守住，否则会互相伤害：
- *   - 复用模式的壳关窗口只退出自己，绝不停止服务器，也不写 server.pid；
+ *   - 复用模式的壳不写 server.pid，也没有「重启服务器」菜单项（重启会换端口，把别人的窗口甩掉）；
  *   - 复用模式的窗口位置单独记在 window-state.secondary.json，免得两个窗口互相覆盖。
+ *
+ * ── 服务器寿命：最后一个窗口退出才停（2026-10-15 第四版，按用户明确要求改）────
+ * 第三版留下的坑：服务器的生死被绑在「起它的那个壳」身上 —— 主窗口一关就 stopServer()，
+ * 副窗口正在用的后端当场消失。用户的原话是「主的关闭了，后台服务不要关闭；只有所有
+ * 启动的 DSH 桌面版都关闭了，才关闭后台服务」。所以第四版把判据整个换掉：
+ *
+ *   服务器该不该停，只看一件事：还有没有窗口在用它（lib/clients.js 的登记表）。
+ *     还有别的壳  → 服务器、地址公告、pid 记录原样保留，本次退出什么都不碰；
+ *     一个都不剩  → 先撤公告（免得后来者连死地址），再停服务器：
+ *                   自己起的直接停子进程；不是自己起的（副本当最后一个）按 pid 记录停。
+ *
+ * 与它配套的两处判据也要跟着换，否则会出现「留着一台没人用的服务」或「误杀别人在用的服务」：
+ *   ① 公告是否可复用（lib/endpoint.js）：看「公告里的服务器进程还活着」，
+ *      不再看「写公告的壳还活着」——主壳退出后公告依然有效，后来者仍能复用；
+ *   ② 启动时是否清理残留（lib/server.js reapStaleServer）：看「还有没有别的活壳」，
+ *      不再只看「起它的壳在不在」——有窗口在用时绝不碰那台服务器。
+ *
+ * 一句话总结这一版的心智模型：**服务器不属于任何窗口，它属于「当前打开着的这些窗口」**。
+ *
+ * ── 代码分工（第四版拆分，main.js 只做 Electron 接线）────────────────────
+ *   lib/quit-flow.js     退出判定与收尾（第四版核心：还有没有窗口在用、该不该回收、怎么回收）
+ *   lib/clients.js       「谁在用服务器」的登记表
+ *   lib/endpoint.js      运行中服务器地址的公告板（含有效性判据）
+ *   lib/server.js        dsh web 子进程的托管（启动 / 解析地址 / 按进程组停止 / 残留清理）
+ *   lib/procinfo.js      进程存活与身份判定（上面三个模块共用，避免语义漂移）
+ *   lib/window-state.js  窗口几何记忆
+ *   lib/menu.js          应用菜单（含「副窗口不能重启服务器」这类模式分支）
+ * 本文件只保留：Electron 事件接线、窗口创建、启动顺序、以及把上面这些模块串起来。
  */
 
-const { app, BrowserWindow, Menu, dialog, shell } = require('electron');
+const { app, BrowserWindow, dialog, shell } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { DshServer, signalProcessGroup } = require('./lib/server');
-const { publishEndpoint, readReusableEndpoint, clearEndpoint } = require('./lib/endpoint');
+const { DshServer } = require('./lib/server');
+const { publishEndpoint, readReusableEndpoint } = require('./lib/endpoint');
+const { countOtherClients } = require('./lib/clients');
+const { QuitFlow } = require('./lib/quit-flow');
+const { buildAppMenu } = require('./lib/menu');
+const { windowStateFile, loadWindowState, saveWindowState } = require('./lib/window-state');
 
 /**
  * 用户级数据目录：日志、窗口状态、服务器 pid 记录、服务器地址公告都放这里。
@@ -55,10 +86,6 @@ const APP_DIR = process.env.DSH_DESKTOP_APP_DIR
 const LOG_FILE = path.join(APP_DIR, 'dsh-server.log');
 /** 桌面壳自身的诊断日志（启动顺序、窗口事件、退出流程等）。 */
 const APP_LOG_FILE = path.join(APP_DIR, 'app.log');
-/** 窗口大小/位置记忆文件（主窗口，即自己托管服务器的那个窗口）。 */
-const WINDOW_STATE_FILE = path.join(APP_DIR, 'window-state.json');
-/** 副窗口（复用别人服务器的那个）自己的几何记忆，与主窗口分开，免得多开时互相覆盖。 */
-const WINDOW_STATE_SECONDARY_FILE = path.join(APP_DIR, 'window-state.secondary.json');
 /** 当前托管服务器的 pid 记录，用于「壳被强杀」后清理残留。 */
 const SERVER_PID_FILE = path.join(APP_DIR, 'server.pid');
 /**
@@ -66,6 +93,14 @@ const SERVER_PID_FILE = path.join(APP_DIR, 'server.pid');
  * 里面带访问 token，所以以 0600 权限写入。
  */
 const ENDPOINT_FILE = path.join(APP_DIR, 'endpoint.json');
+/**
+ * 客户端登记表目录：谁正在使用这台服务器（详见 lib/clients.js）。
+ *
+ * 第四版新增，是本次「最后一个窗口退出才停服务」的判据来源：
+ * 每个壳启动时写一份 `<pid>.json`，退出时删掉；退出前数一数还剩几个，
+ * 一个都不剩才轮到自己去停服务器。
+ */
+const CLIENTS_DIR = path.join(APP_DIR, 'clients');
 /**
  * 退出收尾的硬上限。
  * 正常收尾最坏情况是 4s（SIGTERM 宽限）+ 2s（SIGKILL 后等待），这里留足余量；
@@ -147,11 +182,34 @@ let lastServerPid = null;
 let quitRequested = false;
 /** 退出收尾已经完成，此时再来的 before-quit 直接放行。 */
 let quitReady = false;
-/** 本壳是否复用了别的壳已经在跑的服务器（true 时自己不起服务、也不许停别人的服务）。 */
+/**
+ * 本壳是否复用了别的壳已经在跑的服务器（true 时自己不起服务器、菜单里也没有「重启服务器」）。
+ *
+ * 注意它**不再**意味着「不许停别人的服务」：如果本壳是最后一个使用者，
+ * 它会按 pid 记录把那台不属于自己的服务器停掉（第四版，「最后一个走的人关灯」）。
+ */
 let reusingExistingServer = false;
+/**
+ * 退出判定与收尾（第四版核心逻辑都封在这里，见 lib/quit-flow.js）。
+ *
+ * 它需要知道三件只有 main.js 才知道的事，所以用回调注入：
+ *   ① 本壳现在有没有托管着一台服务器；
+ *   ② 怎么停掉它；
+ *   ③ 本壳是不是「复用别人服务器」的模式。
+ */
+const quitFlow = new QuitFlow({
+  clientsDir: CLIENTS_DIR,
+  endpointFile: ENDPOINT_FILE,
+  serverPidFile: SERVER_PID_FILE,
+  log,
+  hasOwnedServer: () => server !== null && server.running,
+  stopOwnedServer: () => stopServer(),
+  getLastServerPid: () => lastServerPid,
+  isReplica: () => reusingExistingServer
+});
 
 /**
- * 窗口几何记忆文件：主窗口与副窗口分开存。
+ * 窗口几何记忆文件：主窗口与副窗口分开存（读写逻辑在 lib/window-state.js）。
  *
  * 不分开会怎样：两块屏上的窗口大小/位置不同，共用一个文件就会互相覆盖，
  * 每次打开都得重新拖窗口——这正是多开时最容易踩的坑。
@@ -159,48 +217,16 @@ let reusingExistingServer = false;
  * @returns {string} 当前窗口模式对应的状态文件路径。
  */
 function currentWindowStateFile() {
-  return reusingExistingServer ? WINDOW_STATE_SECONDARY_FILE : WINDOW_STATE_FILE;
+  return windowStateFile(APP_DIR, reusingExistingServer);
 }
 
 /**
- * 读取上次的窗口几何信息。
+ * 保存当前窗口的几何信息（每次移动/缩放/关闭窗口都会被调用，所以这里保持简洁）。
  *
- * @param {string} file - 状态文件路径（主窗口/副窗口各有各的）。
- * @returns {{width: number, height: number, x?: number, y?: number, maximized: boolean}} 窗口选项。
+ * @param {BrowserWindow | null} window - 要记录的窗口。
  */
-function loadWindowState(file) {
-  const fallback = { width: 1280, height: 900, maximized: false };
-  try {
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const width = Number.isFinite(raw.width) ? Math.max(640, raw.width) : fallback.width;
-    const height = Number.isFinite(raw.height) ? Math.max(480, raw.height) : fallback.height;
-    const state = { width, height, maximized: raw.maximized === true };
-    if (Number.isFinite(raw.x) && Number.isFinite(raw.y)) {
-      state.x = raw.x;
-      state.y = raw.y;
-    }
-    return state;
-  } catch {
-    return fallback;
-  }
-}
-
-/**
- * 保存窗口几何信息；最大化时保留「还原后」的大小，避免下次打开就是全屏尺寸。
- *
- * @param {BrowserWindow | null} window - 主窗口。
- * @param {string} [file] - 状态文件路径，缺省用当前模式的默认文件。
- */
-function saveWindowState(window, file = currentWindowStateFile()) {
-  if (!window || window.isDestroyed()) return;
-  try {
-    const bounds = window.getNormalBounds();
-    const state = { ...bounds, maximized: window.isMaximized() };
-    fs.mkdirSync(APP_DIR, { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`);
-  } catch (error) {
-    log(`保存窗口状态失败：${String(error)}`);
-  }
+function persistWindowState(window) {
+  saveWindowState(currentWindowStateFile(), window, log);
 }
 
 /**
@@ -214,17 +240,6 @@ function showMainWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
-}
-
-/**
- * 用系统默认程序打开一个路径（日志、配置目录等）。
- *
- * @param {string} target - 文件或目录路径。
- */
-function openExternally(target) {
-  shell.openPath(target).then((error) => {
-    if (error) log(`打开 ${target} 失败：${error}`);
-  });
 }
 
 /** 重启服务器：停掉旧的，重新拉起并刷新窗口地址。 */
@@ -243,18 +258,6 @@ async function restartServer() {
 }
 
 /**
- * 「所有窗口都关闭」时是否应该退出整个程序。
- *
- * - 自己托管服务器的壳：必须退，而且要顺手把服务器收干净（这是原来的语义，不改）；
- * - 复用别人服务器的壳：只退自己。因为服务器不归它管，它也没有停别人的权力。
- *
- * @returns {boolean} true 表示需要退出程序。
- */
-function shouldQuitOnAllWindowsClosed() {
-  return !reusingExistingServer;
-}
-
-/**
  * 启动一个由本壳托管的服务器，并把就绪后的访问地址公告出去。
  *
  * 这里刻意不加载窗口：加载统一由 boot() 收口，这样「自己起服务」和「复用别人的服务」
@@ -267,6 +270,9 @@ async function startServer() {
     port: 0, // 交给系统挑空闲端口，避免与用户手动跑的 dsh web 撞车
     logFile: LOG_FILE,
     pidFile: SERVER_PID_FILE,
+    // 清理残留前先问登记表：还有别的窗口在用服务器时，绝不能把那台当残留清掉。
+    // 注意要排除自己 —— 本壳已经登记过了，不排除的话「永远有别人在用」，残留就再也清不掉了。
+    hasOtherClients: () => countOtherClients(CLIENTS_DIR, { excludePid: process.pid }) > 0,
     // 子进程一 fork 出来就先记下 pid：万一本进程随后被强杀，exit 兜底还有得可用
     onSpawn: (pid) => {
       lastServerPid = Number.isInteger(pid) ? pid : null;
@@ -305,8 +311,16 @@ async function startServer() {
 
   // 注意 server.port 是「请求的端口」，这里传的是 0（让系统挑），所以不能直接用它。
   // 实际端口要从就绪地址里解析。
-  publishEndpoint(ENDPOINT_FILE, { url, port: parsePort(url), shellPid: process.pid });
-  log('已公告服务器地址，后续启动的窗口将复用它');
+  //
+  // serverPid 是第四版加的关键字段：公告的有效性从此看它（服务器还活着吗），
+  // 而不是看 shellPid（起服务器的壳还活着吗）—— 主壳退出后公告必须继续有效。
+  publishEndpoint(ENDPOINT_FILE, {
+    url,
+    port: parsePort(url),
+    serverPid: server.pid,
+    shellPid: process.pid
+  });
+  log(`已公告服务器地址（serverPid=${String(server.pid)}），后续启动的窗口将复用它`);
 }
 
 /**
@@ -327,10 +341,19 @@ function parsePort(url) {
 /**
  * 是否已经有一个活着的、可以复用的服务器在跑。
  *
- * @returns {boolean} true 表示公告文件指向一个仍在运行的服务器。
+ * 两个条件都要满足（第四版）：
+ *   ① 公告指向的服务器进程确实还活着（判据在 lib/endpoint.js，含命令行身份核对）；
+ *   ② 除自己之外还有别的壳活着 —— 也就是「真的有人在用它」。
+ *
+ * 为什么要加 ②：如果所有窗口都退干净了、只留下一台没人用的服务器（所有壳都被 kill -9
+ * 时会发生），那台服务按本程序的语义就该被回收，而不是被下一个窗口捡起来接着用。
+ * 加上这一条，「没有窗口在跑 ⇒ 后台服务不该存在」这个不变量在启动流程里也成立。
+ *
+ * @returns {boolean} true 表示可以复用现成的服务器地址。
  */
 function hasReusableEndpoint() {
-  return readReusableEndpoint(ENDPOINT_FILE) !== null;
+  if (!readReusableEndpoint(ENDPOINT_FILE)) return false;
+  return countOtherClients(CLIENTS_DIR, { excludePid: process.pid }) > 0;
 }
 
 /**
@@ -369,16 +392,17 @@ async function waitForReusableEndpoint(timeoutMs = REUSE_WAIT_TIMEOUT_MS) {
 async function attachToExistingServer() {
   const endpoint = readReusableEndpoint(ENDPOINT_FILE);
   if (!endpoint) {
-    // 竞态窗口：判定可用之后、真正连接之前，主实例退出了。
+    // 竞态窗口：判定可用之后、真正连接之前，那台服务器被回收了
+    // （最后一个窗口在这几百毫秒里退出了，公告与服务器一起收掉）。
     // 此时窗口是隐藏的，用户会以为程序没启动 —— 所以显式报出来并让用户决定。
-    log('复用地址在连接前消失（主实例可能刚好退出）');
+    log('复用地址在连接前消失（其他窗口可能刚好全部退出）');
     if (mainWindow && !mainWindow.isDestroyed()) {
       showMainWindow();
       await dialog.showMessageBox(mainWindow, {
         type: 'warning',
         title: 'DSH 服务器已不可用',
         message: '刚才检测到的 DSH 服务器已经停止。',
-        detail: '它可能是被主窗口关闭时一起停掉的。请重新打开 DSH。',
+        detail: '所有窗口都关闭时，后台服务会被一并回收。请重新打开 DSH。',
         buttons: ['退出']
       });
     }
@@ -386,7 +410,10 @@ async function attachToExistingServer() {
     return;
   }
 
-  log(`复用已有实例的服务器（shellPid=${endpoint.shellPid}，端口 ${String(endpoint.port)}），本窗口不再启动服务器`);
+  log(
+    `复用已有实例的服务器（serverPid=${String(endpoint.serverPid)}，起它的壳 pid=${String(endpoint.shellPid)}，` +
+      `端口 ${String(endpoint.port)}），本窗口不再启动服务器`
+  );
   if (mainWindow && !mainWindow.isDestroyed()) await mainWindow.loadURL(endpoint.url);
 }
 
@@ -402,6 +429,16 @@ async function boot() {
   fs.mkdirSync(APP_DIR, { recursive: true });
   log(`应用启动（electron ${process.versions.electron}，${reusingExistingServer ? '未持锁' : '持锁'}）`);
 
+  // 第一件事：把自己登记进「谁在用后台服务」的名单（lib/quit-flow.js → lib/clients.js）。
+  // 必须早于任何退出判定：此刻可能正有别的窗口在退出，它按这份名单决定服务器留不留；
+  // 我们晚登记一步，就会被它当成「没人用了」，把服务器连同我们即将加载的地址一起收走。
+  const registered = quitFlow.registerSelf();
+  log(
+    registered
+      ? `已登记本窗口（pid=${process.pid}），当前另有 ${quitFlow.countOthers()} 个窗口在用后台服务`
+      : '登记本窗口失败（不影响本窗口使用，但别的窗口退出时可能看不到我们，从而提前回收服务）'
+  );
+
   // 窗口建出来之后，模式（主 / 副）就不能再变了：菜单、窗口标题、窗口几何状态文件
   // 都按模式分两套，建好了再改就会出现「菜单是主窗口的、窗口是副窗口的」这种错配。
   // 所以窗口只建一次，之前先把模式定下来（锁的结果 + 有没有可复用的地址）。
@@ -415,13 +452,13 @@ async function boot() {
       log(`等待 ${REUSE_WAIT_TIMEOUT_MS / 1000} 秒仍未拿到可复用地址，退回主窗口（自己起服务器）`);
     }
   } else if (hasReusableEndpoint()) {
-    // 抢到锁却又发现有活着的服务器：极罕见（例如主实例刚崩、锁已释放但公告还在）。
-    // 能省一个 node 服务进程就省，接上它即可。
+    // 抢到锁却又发现有活着的服务器：极罕见（例如持有它的窗口刚崩、锁已释放但服务还在，
+    // 而另一个窗口正在用它）。能省一个 node 服务进程就省，接上它即可。
     reusingExistingServer = true;
     log('持锁但检测到可复用的服务器地址，改用复用模式');
   }
 
-  buildAppMenu();
+  installAppMenu();
   mainWindow = createWindow();
 
   try {
@@ -431,7 +468,7 @@ async function boot() {
       // 免得用户先看到一块空白背景。showMainWindow 同时负责日志与几何落盘。
       if (mainWindow && !mainWindow.isDestroyed()) {
         showMainWindow();
-        saveWindowState(mainWindow);
+        persistWindowState(mainWindow);
       }
       return;
     }
@@ -574,19 +611,19 @@ function createWindow() {
       // 立刻落一次盘：resize/move/close 只在用户动过窗口、或走到关闭流程时才触发；
       // 如果窗口建好后一直没被动过就被强杀（kill -9 / 崩溃），几何信息就丢了。
       // 这里先写一次，保证「第一次打开」的位置也被记住。
-      saveWindowState(window);
+      persistWindowState(window);
     });
   }
 
   // 关窗口就是退出：这里不拦截，只在窗口销毁前把几何信息落盘。
   // 真正的收尾（停服务器）由下面的 before-quit 统一负责。
-  window.on('close', () => saveWindowState(window));
+  window.on('close', () => persistWindowState(window));
   window.on('closed', () => {
     mainWindow = null;
   });
 
-  window.on('resize', () => saveWindowState(window));
-  window.on('move', () => saveWindowState(window));
+  window.on('resize', () => persistWindowState(window));
+  window.on('move', () => persistWindowState(window));
 
   // 标题由本程序独占决定，不允许页面改。
   // 为什么：dsh 网页端在加载完成后会设置 document.title（实测窗口标题会变成
@@ -639,90 +676,26 @@ function currentAccessUrl() {
 }
 
 /**
- * 应用级菜单。
+ * 安装应用菜单（菜单内容与模式分支都在 lib/menu.js 里）。
  *
- * 原来有一半功能挂在系统托盘菜单上，第二版去掉托盘后统一挪到这里：
- * 应用菜单在窗口标题栏下方（autoHideMenuBar 让 Linux 上按 Alt 也能唤出）。
- *
- * 菜单按窗口模式分两套（第三版）：副窗口的服务器是别人的，
- * 「重启服务器」在它这里只会另起一个自己的服务（与主实例抢端口、也让用户困惑），
- * 所以副窗口把那两项换成「重新加载界面」这类只作用于自己窗口的操作。
+ * 放在启动早期调用，让用户一打开窗口就能看到菜单，而不是先看一段空白。
  */
-function buildAppMenu() {
-  /** @type {Electron.MenuItemConstructorOptions[]} 与服务器相关的菜单项，两种模式不同。 */
-  const serverItems = reusingExistingServer
-    ? [
-        {
-          label: '在浏览器中打开当前地址',
-          click: () => {
-            const url = currentAccessUrl();
-            if (url) void shell.openExternal(url);
-            else dialog.showMessageBox({ type: 'info', message: '服务器已停止，没有可打开的地址。', buttons: ['好'] });
-          }
-        },
-        {
-          label: '重新加载界面',
-          click: () => {
-            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload();
-          }
-        }
-      ]
-    : [
-        {
-          label: '在浏览器中打开当前地址',
-          click: () => {
-            const url = currentAccessUrl();
-            if (url) void shell.openExternal(url);
-          }
-        },
-        { label: '重启服务器', click: () => void restartServer() }
-      ];
-
-  Menu.setApplicationMenu(
-    Menu.buildFromTemplate([
-      {
-        label: 'DSH',
-        submenu: [
-          { label: '显示窗口', accelerator: 'CmdOrCtrl+Shift+D', click: () => showMainWindow() },
-          ...serverItems,
-          { type: 'separator' },
-          { label: '查看服务器日志', click: () => openExternally(LOG_FILE) },
-          { label: '打开数据目录', click: () => openExternally(APP_DIR) },
-          { type: 'separator' },
-          {
-            label: reusingExistingServer ? '退出本窗口（服务器由主窗口继续运行）' : '退出（会一并停掉后台服务）',
-            accelerator: 'CmdOrCtrl+Q',
-            click: () => app.quit()
-          }
-        ]
+function installAppMenu() {
+  buildAppMenu({
+    replica: reusingExistingServer,
+    appDir: APP_DIR,
+    logFile: LOG_FILE,
+    log,
+    actions: {
+      showWindow: showMainWindow,
+      currentAccessUrl,
+      restartServer,
+      reloadWindow: () => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload();
       },
-      {
-        label: '编辑',
-        submenu: [
-          { role: 'undo', label: '撤销' },
-          { role: 'redo', label: '重做' },
-          { type: 'separator' },
-          { role: 'cut', label: '剪切' },
-          { role: 'copy', label: '复制' },
-          { role: 'paste', label: '粘贴' },
-          { role: 'selectAll', label: '全选' }
-        ]
-      },
-      {
-        label: '视图',
-        submenu: [
-          { role: 'reload', label: '重新加载界面' },
-          { role: 'toggleDevTools', label: '开发者工具' },
-          { type: 'separator' },
-          { role: 'resetZoom', label: '重置缩放' },
-          { role: 'zoomIn', label: '放大' },
-          { role: 'zoomOut', label: '缩小' },
-          { type: 'separator' },
-          { role: 'togglefullscreen', label: '全屏' }
-        ]
-      }
-    ])
-  );
+      quit: () => app.quit()
+    }
+  });
 }
 
 /**
@@ -753,15 +726,10 @@ app.whenReady().then(() => {
   void boot();
 });
 
-// 窗口没了就退出程序（第一版会留一个隐藏窗口 + 服务器在后台，正是这次要修的问题）
+// 窗口没了就退出本进程。注意「退出本进程」不等于「停掉后台服务」：
+// 是否回收服务器由 before-quit 按「还有没有别的窗口在用」决定，这里不预判。
 app.on('window-all-closed', () => {
-  // 复用别人服务器的壳：关掉自己的窗口只退自己，绝不去动（也动不了）主实例的服务
-  if (!shouldQuitOnAllWindowsClosed()) {
-    log('副窗口已关闭，仅退出本进程（服务器由主实例继续持有）');
-    app.quit();
-    return;
-  }
-  log('所有窗口已关闭，退出程序');
+  log('所有窗口已关闭，退出进程（服务器是否回收由「还有没有别的窗口」决定）');
   app.quit();
 });
 
@@ -780,14 +748,15 @@ for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   });
 }
 
-// 统一退出流程：先把服务器收干净，再真正退出
+// 统一退出流程：先判定「还有没有窗口在用这台服务器」，再决定留还是收。
+// 判定与收尾的细节都在 lib/quit-flow.js，这里只负责 Electron 的生命周期与兜底超时。
 app.on('before-quit', (event) => {
   if (quitReady) return; // 收尾已完成，放行
   event.preventDefault(); // 还没收尾，先别退
   if (quitRequested) return; // 收尾进行中，重复的退出请求忽略
   quitRequested = true;
   log('开始退出流程');
-  saveWindowState(mainWindow);
+  persistWindowState(mainWindow);
 
   // 兜底：服务器万一赖着不走，也不能让窗口关不掉
   const forceTimer = setTimeout(() => {
@@ -795,13 +764,9 @@ app.on('before-quit', (event) => {
     app.exit(0);
   }, SHUTDOWN_TIMEOUT_MS);
 
-  // 先撤公告再停服务器：反过来的话，公告会在服务器已死的窗口期里仍然指向那个地址，
-  // 这时新开的壳会复用一个连不上的地址。clearEndpoint 只删「属主是自己」的公告，
-  // 所以副窗口退出时不会误删主实例的公告。
-  if (clearEndpoint(ENDPOINT_FILE, process.pid)) log('已撤下服务器地址公告');
-
-  void stopServer()
-    .catch((error) => log(`停止服务器时出错：${String(error)}`))
+  void quitFlow
+    .run()
+    .catch((error) => log(`退出收尾出错：${String(error)}`))
     .finally(() => {
       clearTimeout(forceTimer);
       quitReady = true;
@@ -811,16 +776,11 @@ app.on('before-quit', (event) => {
 });
 
 /**
- * 最后一层保险：进程直接走到 exit（before-quit 没跑完的异常路径）时，
- * 同步把服务器收掉。能走到这里的场景已经没机会优雅停机了，直接用 SIGKILL。
+ * 最后一层保险：进程直接走到 exit（before-quit 没跑完的异常路径）时，同步把服务器收掉。
+ * 判据与正常路径完全一致（还有别的窗口在用就什么都不碰），细节见 lib/quit-flow.js。
  */
 process.on('exit', () => {
-  // 公告也要撤：否则被 kill -9 的壳会留下一个指向死地址的公告，
-  // 下一个壳读到它就会去连一个不存在的服务器。
-  clearEndpoint(ENDPOINT_FILE, process.pid);
-  if (lastServerPid === null) return;
-  log(`进程直接退出，强制回收服务器进程组 ${String(lastServerPid)}`);
-  signalProcessGroup(lastServerPid, 'SIGKILL');
+  quitFlow.runSyncFallback();
 });
 
 process.on('uncaughtException', (error) => {
